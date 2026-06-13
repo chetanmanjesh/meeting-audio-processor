@@ -1141,7 +1141,7 @@ function renderStyle(style) {
     wrap.style.cssText = "padding: 24px; text-align: center;";
     const note = document.createElement("div");
     note.style.cssText = "color: var(--muted); font-size: 14px; margin-bottom: 12px; line-height: 1.5;";
-    note.innerHTML = "A concise version is a tightened, client-friendly rewrite of the detailed MoM.<br>Skips redundant detail, merges related sign-offs. Takes ~2 minutes and costs roughly ₹6 in Claude tokens.";
+    note.innerHTML = "A concise version is a tightened, client-friendly rewrite of the detailed MoM.<br>Skips redundant detail and merges related sign-offs. Takes ~2 minutes.";
     const btn = document.createElement("button");
     btn.textContent = "Generate concise version";
     btn.className = "primary";

@@ -339,7 +339,10 @@ def fill_template(template_path: Path, mom: dict, meta: dict, out_path: Path) ->
 
     fill_action_items_table(doc.tables[1], mom.get("action_items", []))
 
-    ph = placeholder_after(doc, lambda t: "OPEN ITEMS" in t.upper())
+    # Use startswith (not substring `in`) so a discussion_notes bullet that happens
+    # to contain the phrase "open items" doesn't get picked up as the OPEN ITEMS
+    # section heading and steal the placeholder injection.
+    ph = placeholder_after(doc, lambda t: t.strip().upper().startswith("OPEN ITEMS"))
     if ph is not None:
         replace_paragraph_with_structured(ph, build_open_items_blocks(mom))
 
