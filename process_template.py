@@ -33,8 +33,9 @@ DEFAULT_TEMPLATE = Path(__file__).parent / "template.docx"
 
 # ---------- docx-writing helpers ----------
 
-def set_cell_text(cell, text: str) -> None:
+def set_cell_text(cell, text) -> None:
     """Replace a cell's text, preserving the formatting of its first run."""
+    text = "" if text is None else str(text)
     for p in cell.paragraphs[1:]:
         p._element.getparent().remove(p._element)
     p = cell.paragraphs[0]
@@ -311,13 +312,15 @@ def fill_template_to_bytes(template_path: Path, mom: dict, meta: dict) -> bytes:
 def auto_meta(mom: dict, prepared_by: str = "Studio team") -> dict:
     """Build default meta from the MoM itself — date today, format from meeting_mode,
     subject from summary, attendees from speakers."""
-    summary = mom.get("summary", "—")
+    summary = mom.get("summary") or "—"
+    meeting_mode = mom.get("meeting_mode") or "Audio recording"
+    subject = (summary.split(".")[0][:120] if summary and summary != "—" else "—")
     return {
         "date": date.today().strftime("%d %B %Y"),
-        "format": mom.get("meeting_mode") or "Audio recording",
-        "subject": (summary.split(".")[0][:120] if summary else "—"),
-        "attendees": derive_attendees(mom),
-        "prepared_by": prepared_by,
+        "format": meeting_mode,
+        "subject": subject,
+        "attendees": derive_attendees(mom) or "—",
+        "prepared_by": prepared_by or "Studio team",
     }
 
 

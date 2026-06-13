@@ -109,6 +109,67 @@ def _r2_delete(key: str) -> None:
         pass
 
 
+def _r2_put_json(key: str, data) -> None:
+    """Best-effort write JSON to R2 (used to cache intermediate outputs for retry)."""
+    try:
+        s3 = _r2_client()
+        if not s3:
+            return
+        s3.put_object(
+            Bucket=R2_BUCKET_NAME,
+            Key=key,
+            Body=json.dumps(data, ensure_ascii=False).encode("utf-8"),
+            ContentType="application/json",
+        )
+    except Exception:
+        pass
+
+
+def _r2_put_text(key: str, text: str) -> None:
+    try:
+        s3 = _r2_client()
+        if not s3:
+            return
+        s3.put_object(
+            Bucket=R2_BUCKET_NAME, Key=key,
+            Body=text.encode("utf-8"), ContentType="text/plain; charset=utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _r2_get_json(key: str):
+    """Read JSON from R2, return None if not found."""
+    try:
+        s3 = _r2_client()
+        if not s3:
+            return None
+        obj = s3.get_object(Bucket=R2_BUCKET_NAME, Key=key)
+        return json.loads(obj["Body"].read())
+    except Exception:
+        return None
+
+
+def _r2_get_text(key: str):
+    try:
+        s3 = _r2_client()
+        if not s3:
+            return None
+        obj = s3.get_object(Bucket=R2_BUCKET_NAME, Key=key)
+        return obj["Body"].read().decode("utf-8")
+    except Exception:
+        return None
+
+
+def _cache_keys(job_id: str) -> dict:
+    """The R2 keys we use to cache intermediates per job for resumability."""
+    return {
+        "transcript": f"cache/{job_id}/transcript.txt",
+        "detailed":   f"cache/{job_id}/detailed.json",
+        "concise":    f"cache/{job_id}/concise.json",
+    }
+
+
 def stitch_files(audio_paths: list[Path], out_stem: Path) -> Path:
     """Stitch multiple audio files via ffmpeg. Fast path (no re-encode) first,
     fallback to re-encode for mixed formats. Returns the stitched file path."""
@@ -178,47 +239,66 @@ def _process_job(job_id: str, r2_keys: list[str], filenames: list[str], provider
 
     audio_paths: list[Path] = []
     stitched_path: Optional[Path] = None
+    ck = _cache_keys(job_id)
+
+    # Resume support: load any already-completed intermediates from in-memory JOBS
+    # first, then fall back to R2 cache (survives Render restarts/redeploys).
+    with JOBS_LOCK:
+        job_snapshot = dict(JOBS.get(job_id, {}))
+    transcript = job_snapshot.get("transcript") or _r2_get_text(ck["transcript"])
+    detailed_mom = job_snapshot.get("detailed_mom") or _r2_get_json(ck["detailed"])
+    concise_mom = job_snapshot.get("concise_mom") or _r2_get_json(ck["concise"])
+
     try:
-        # 1) Download each R2 object to a local temp file.
-        update(status="downloading", step="downloading", progress_chars=0, progress_step=None)
-        for key, fname in zip(r2_keys, filenames):
-            suffix = Path(fname or "audio.webm").suffix or ".webm"
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-            tmp.close()
-            _r2_download(key, Path(tmp.name))
-            audio_paths.append(Path(tmp.name))
+        # ---- Step 1: Download + transcribe (skip if cached) ----
+        if not transcript:
+            update(status="downloading", step="downloading", progress_chars=0, progress_step=None)
+            for key, fname in zip(r2_keys, filenames):
+                suffix = Path(fname or "audio.webm").suffix or ".webm"
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+                tmp.close()
+                _r2_download(key, Path(tmp.name))
+                audio_paths.append(Path(tmp.name))
 
-        if len(audio_paths) > 1:
-            update(status="stitching", step="stitching", progress_chars=0)
-            stem = audio_paths[0].with_suffix("")
-            stitched_path = stitch_files(audio_paths, stem)
-            audio_to_process = stitched_path
-        else:
-            audio_to_process = audio_paths[0]
+            if len(audio_paths) > 1:
+                update(status="stitching", step="stitching", progress_chars=0)
+                stem = audio_paths[0].with_suffix("")
+                stitched_path = stitch_files(audio_paths, stem)
+                audio_to_process = stitched_path
+            else:
+                audio_to_process = audio_paths[0]
 
-        update(status="transcribing", step="transcription", progress_chars=0, progress_step=None)
+            update(status="transcribing", step="transcription", progress_chars=0, progress_step=None)
+            if provider == "deepgram":
+                if not os.environ.get("DEEPGRAM_API_KEY"):
+                    raise RuntimeError("DEEPGRAM_API_KEY not set on server")
+                dg = base.transcribe(audio_to_process, timeout_seconds=1800.0)
+                transcript = base.format_transcript(dg)
+            else:
+                if not os.environ.get("SARVAM_API_KEY"):
+                    raise RuntimeError("SARVAM_API_KEY not set on server")
+                sv = sarvam_pipeline.transcribe_sarvam(audio_to_process)
+                transcript = sarvam_pipeline.format_sarvam_transcript(sv)
 
-        if provider == "deepgram":
-            if not os.environ.get("DEEPGRAM_API_KEY"):
-                raise RuntimeError("DEEPGRAM_API_KEY not set on server")
-            dg = base.transcribe(audio_to_process, timeout_seconds=1800.0)
-            transcript = base.format_transcript(dg)
-        else:  # sarvam
-            if not os.environ.get("SARVAM_API_KEY"):
-                raise RuntimeError("SARVAM_API_KEY not set on server")
-            sv = sarvam_pipeline.transcribe_sarvam(audio_to_process)
-            transcript = sarvam_pipeline.format_sarvam_transcript(sv)
+            update(transcript=transcript)
+            _r2_put_text(ck["transcript"], transcript)
 
-        # Detailed extraction (shared prompt — same for Deepgram and Sarvam)
-        update(status="extracting_detailed", step="mom_extraction_detailed",
-               progress_chars=0, progress_step="mom_extraction_detailed")
-        detailed_mom = base.extract_mom(transcript, on_progress=make_progress("mom_extraction_detailed"))
+        # ---- Step 2: Detailed MoM (skip if cached) ----
+        if not detailed_mom:
+            update(status="extracting_detailed", step="mom_extraction_detailed",
+                   progress_chars=0, progress_step="mom_extraction_detailed")
+            detailed_mom = base.extract_mom(transcript, on_progress=make_progress("mom_extraction_detailed"))
+            update(detailed_mom=detailed_mom)
+            _r2_put_json(ck["detailed"], detailed_mom)
         detailed_md = base.render_markdown(detailed_mom)
 
-        # Concise condense (same source, tighter prose + merging of same-fact items)
-        update(status="condensing", step="mom_extraction_concise",
-               progress_chars=0, progress_step="mom_extraction_concise")
-        concise_mom = base.condense_to_concise(detailed_mom, on_progress=make_progress("mom_extraction_concise"))
+        # ---- Step 3: Concise MoM (skip if cached) ----
+        if not concise_mom:
+            update(status="condensing", step="mom_extraction_concise",
+                   progress_chars=0, progress_step="mom_extraction_concise")
+            concise_mom = base.condense_to_concise(detailed_mom, on_progress=make_progress("mom_extraction_concise"))
+            update(concise_mom=concise_mom)
+            _r2_put_json(ck["concise"], concise_mom)
         concise_md = base.render_markdown(concise_mom)
 
         # Render both docx (template metadata auto-derived from the MoM itself)
@@ -241,6 +321,10 @@ def _process_job(job_id: str, r2_keys: list[str], filenames: list[str], provider
             finished_at=time.time(),
         )
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        # Always print the full traceback to stdout so it shows up in Render logs.
+        print(tb, file=sys.stderr if False else __import__("sys").stderr, flush=True)
         # Friendly-ify common provider errors so the UI isn't a wall of HTTP headers.
         raw = str(e)
         friendly = raw
@@ -253,9 +337,9 @@ def _process_job(job_id: str, r2_keys: list[str], filenames: list[str], provider
             friendly = "Anthropic rejected the request (auth). Check ANTHROPIC_API_KEY on the server."
         elif "rate_limit" in low or "429" in raw:
             friendly = "Rate limit hit on a provider. Wait a minute and retry."
-        update(status="failed", error=friendly, error_raw=raw[:2000], finished_at=time.time())
+        update(status="failed", error=friendly, error_raw=tb[:4000], finished_at=time.time())
     finally:
-        # Clean up local temp files
+        # Local temp files always cleaned (free disk on Render's small instances).
         for p in audio_paths:
             try:
                 p.unlink(missing_ok=True)
@@ -266,9 +350,17 @@ def _process_job(job_id: str, r2_keys: list[str], filenames: list[str], provider
                 stitched_path.unlink(missing_ok=True)
             except Exception:
                 pass
-        # Clean up R2 objects (best-effort — they have a lifecycle rule too as a safety net)
-        for key in r2_keys:
-            _r2_delete(key)
+        # R2 audio cleanup: only on SUCCESS. On failure we keep the audio + the
+        # cached intermediates so the user can hit Retry without re-paying for
+        # Sarvam/Deepgram and Claude. (R2 lifecycle rule auto-deletes after 1 day
+        # as a safety net.)
+        with JOBS_LOCK:
+            final_status = JOBS.get(job_id, {}).get("status")
+        if final_status == "done":
+            for key in r2_keys:
+                _r2_delete(key)
+            for k in _cache_keys(job_id).values():
+                _r2_delete(k)
 
 
 # ---------- routes ----------
@@ -344,6 +436,9 @@ def create_job(
             "n_files": len(r2_keys),
             "created_at": time.time(),
             "error": None,
+            # Stored so /jobs/{id}/retry can re-invoke _process_job without re-uploading.
+            "_r2_keys": r2_keys,
+            "_filenames": filenames,
         }
 
     thread = threading.Thread(
@@ -356,6 +451,7 @@ def create_job(
 _HEAVY_KEYS = {
     "transcript", "detailed_mom", "detailed_markdown", "concise_mom",
     "concise_markdown", "detailed_docx", "concise_docx",
+    "_r2_keys", "_filenames",
 }
 
 
@@ -392,6 +488,52 @@ def get_result(job_id: str, token: Optional[str] = Query(None)):
                 "markdown": job.get("concise_markdown"),
             },
         })
+
+
+@app.post("/jobs/{job_id}/retry")
+def retry_job(job_id: str, token: Optional[str] = Query(None)):
+    """Re-run a failed job, skipping any step whose output is already cached
+    (in-memory in JOBS or persistently in R2). Saves Claude/Sarvam credits when
+    a tail-end step fails."""
+    _check_token(token)
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            # Job lost from memory (Render restart). Try to rehydrate from R2 cache.
+            ck = _cache_keys(job_id)
+            cached_transcript = _r2_get_text(ck["transcript"])
+            cached_detailed = _r2_get_json(ck["detailed"])
+            cached_concise = _r2_get_json(ck["concise"])
+            if not (cached_transcript or cached_detailed or cached_concise):
+                raise HTTPException(status_code=404, detail="job not found and no cache exists")
+            # Need provider + r2_keys + filenames to retry — these are lost on restart.
+            # For now, signal that the user has to resubmit, but we'll preserve the cache.
+            raise HTTPException(
+                status_code=409,
+                detail="Job was wiped from memory (Render restart). Resubmit the same audio; cached intermediates will still be used.",
+            )
+        if job["status"] not in ("failed",):
+            raise HTTPException(status_code=409, detail=f"can only retry failed jobs (current status: {job['status']})")
+        # Reset error fields, keep cached intermediates (transcript, detailed_mom, concise_mom)
+        job["status"] = "queued"
+        job["step"] = None
+        job["progress_chars"] = None
+        job["progress_step"] = None
+        job["error"] = None
+        job.pop("error_raw", None)
+        # We need r2_keys, filenames, and provider from the original submission.
+        # Stored on the job dict by create_job; if missing (older runs), reject.
+        r2_keys = job.get("_r2_keys")
+        filenames = job.get("_filenames")
+        provider = job["provider"]
+        if not r2_keys:
+            raise HTTPException(status_code=409, detail="job has no stored audio references; resubmit")
+
+    thread = threading.Thread(
+        target=_process_job, args=(job_id, r2_keys, filenames, provider), daemon=True
+    )
+    thread.start()
+    return {"job_id": job_id, "status": "queued"}
 
 
 @app.get("/jobs/{job_id}/docx")
@@ -482,18 +624,18 @@ INDEX_HTML = r"""<!doctype html>
   <section>
     <h2>1. Pick a transcription provider</h2>
     <div class="provider-grid" id="providers">
-      <label class="provider selected" data-provider="sarvam">
-        <input type="radio" name="provider" value="sarvam" checked>
+      <label class="provider selected" data-provider="deepgram">
+        <input type="radio" name="provider" value="deepgram" checked>
         <div>
-          <div class="name">Sarvam (Saarika) <span style="color:var(--accent); font-size:12px; font-weight:600;">— pick when detail matters</span></div>
-          <div class="desc">Captures vendor names ("EBIT Flow"), brand mentions, exact specs ("50mm cement board"), and single-mention details reliably. Handles Kannada / Hindi / Tamil / Telugu natively. <strong>Pick for:</strong> client-facing MoMs, BOQ-prep meetings, vendor selection calls — anything where granular detail will feed procurement or contracts. Slower and ~3-4× costlier per minute.</div>
+          <div class="name">Deepgram (nova-3) <span style="color:var(--accent); font-size:12px; font-weight:600;">— default</span></div>
+          <div class="desc">Fastest and cheapest. Reliably captures high-level decisions, sign-offs, and action items — the bulk of any MoM. <strong>Pick for:</strong> routine internal coordination meetings where you mainly need the decision log. <strong>Skip when:</strong> the meeting includes vendor selections, exact specs, or substantial Kannada — Deepgram tends to drop named brands, dimensions, and code-switched bits that are only said once.</div>
         </div>
       </label>
-      <label class="provider" data-provider="deepgram">
-        <input type="radio" name="provider" value="deepgram">
+      <label class="provider" data-provider="sarvam">
+        <input type="radio" name="provider" value="sarvam">
         <div>
-          <div class="name">Deepgram (nova-3)</div>
-          <div class="desc">Fastest and cheapest. Reliably captures high-level decisions, sign-offs, and action items — the bulk of any MoM. <strong>Pick for:</strong> routine internal coordination meetings where you mainly need the decision log. <strong>Skip when:</strong> the meeting includes vendor selections, exact specs, or substantial Kannada — Deepgram tends to drop named brands, dimensions, and code-switched bits that are only said once.</div>
+          <div class="name">Sarvam (Saarika) <span style="color:var(--muted); font-size:12px;">— pick when detail matters</span></div>
+          <div class="desc">Captures vendor names ("EBIT Flow"), brand mentions, exact specs ("50mm cement board"), and single-mention details reliably. Handles Kannada / Hindi / Tamil / Telugu natively. <strong>Pick for:</strong> client-facing MoMs, BOQ-prep meetings, vendor selection calls — anything where granular detail will feed procurement or contracts. Slower and ~3-4× costlier per minute.</div>
         </div>
       </label>
     </div>
@@ -876,7 +1018,7 @@ async function pollJob(jobId) {
         return;
       }
       if (job.status === "failed") {
-        showError("Processing failed: " + (job.error || "unknown"));
+        showErrorWithRetry(jobId, job.error || "unknown");
         $("submitBtn").disabled = false;
         return;
       }
@@ -946,6 +1088,40 @@ function textBlobUrl(text, type = "text/plain") {
 function showError(msg) {
   const e = $("error");
   e.textContent = msg;
+  e.style.display = "block";
+}
+
+function showErrorWithRetry(jobId, msg) {
+  const e = $("error");
+  e.innerHTML = "";
+  const text = document.createElement("div");
+  text.textContent = "Processing failed: " + msg;
+  e.appendChild(text);
+  const note = document.createElement("div");
+  note.style.cssText = "font-size:13px; color:var(--muted); margin-top:6px;";
+  note.textContent = "Cached intermediates will be reused — retrying won't re-pay for transcription or Claude steps already completed.";
+  e.appendChild(note);
+  const btn = document.createElement("button");
+  btn.textContent = "↻ Retry";
+  btn.className = "primary";
+  btn.style.marginTop = "10px";
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    btn.textContent = "Retrying…";
+    const tokenParam = accessToken ? `?token=${encodeURIComponent(accessToken)}` : "";
+    try {
+      const r = await fetch(`/jobs/${jobId}/retry${tokenParam}`, { method: "POST" });
+      if (!r.ok) throw new Error(await r.text());
+      e.style.display = "none";
+      $("submitStatus").textContent = "Retrying job…";
+      pollJob(jobId);
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = "↻ Retry";
+      showError("Retry failed: " + err.message);
+    }
+  });
+  e.appendChild(btn);
   e.style.display = "block";
 }
 </script>
