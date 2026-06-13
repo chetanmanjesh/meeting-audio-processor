@@ -11,10 +11,15 @@ Run locally:
 Deploy on Render: see render.yaml in this directory.
 
 Environment:
-    DEEPGRAM_API_KEY   required if user selects Deepgram
-    SARVAM_API_KEY     required if user selects Sarvam
-    ANTHROPIC_API_KEY  required for both (MoM generation)
-    ACCESS_TOKEN       optional. If set, every request needs ?token=<value>.
+    DEEPGRAM_API_KEY        required if user selects Deepgram
+    SARVAM_API_KEY          required if user selects Sarvam
+    ANTHROPIC_API_KEY       required for both (MoM generation)
+    ACCESS_TOKEN            optional. If set, every request needs ?token=<value>.
+
+    R2_ACCOUNT_ID           required. Cloudflare R2 account ID.
+    R2_ACCESS_KEY_ID        required. R2 API token access key.
+    R2_SECRET_ACCESS_KEY    required. R2 API token secret.
+    R2_BUCKET_NAME          required. The R2 bucket holding uploaded audio.
 """
 
 import json
@@ -27,9 +32,11 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+import boto3
 import imageio_ffmpeg
+from botocore.client import Config as BotoConfig
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 
 import process as base
@@ -54,6 +61,52 @@ ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 def _check_token(token: Optional[str]) -> None:
     if ACCESS_TOKEN and token != ACCESS_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid or missing token")
+
+
+# ---------- R2 (Cloudflare object storage, S3-compatible) ----------
+
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY")
+R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME")
+R2_ENABLED = all([R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME])
+
+
+def _r2_client():
+    if not R2_ENABLED:
+        return None
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        region_name="auto",
+        config=BotoConfig(signature_version="s3v4"),
+    )
+
+
+def _require_r2():
+    if not R2_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="R2 storage not configured on server (set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME).",
+        )
+
+
+def _r2_download(key: str, local_path: Path) -> None:
+    """Download an R2 object to a local file."""
+    s3 = _r2_client()
+    s3.download_file(R2_BUCKET_NAME, key, str(local_path))
+
+
+def _r2_delete(key: str) -> None:
+    """Best-effort delete; swallow errors."""
+    try:
+        s3 = _r2_client()
+        if s3:
+            s3.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
+    except Exception:
+        pass
 
 
 def stitch_files(audio_paths: list[Path], out_stem: Path) -> Path:
@@ -105,10 +158,10 @@ def stitch_files(audio_paths: list[Path], out_stem: Path) -> Path:
 
 # ---------- background processing ----------
 
-def _process_job(job_id: str, audio_paths: list[Path], provider: str) -> None:
-    """Run the full pipeline. Stitches multi-file inputs, transcribes,
-    extracts MoM. No standalone translation step — Claude reads the
-    multilingual transcript directly and outputs the MoM in English."""
+def _process_job(job_id: str, r2_keys: list[str], filenames: list[str], provider: str) -> None:
+    """Run the full pipeline. Downloads each R2 key to a local temp file,
+    stitches if needed, transcribes, extracts MoM. No standalone translation
+    step — Claude reads the multilingual transcript directly."""
     def update(**fields):
         with JOBS_LOCK:
             JOBS[job_id].update(fields)
@@ -123,8 +176,18 @@ def _process_job(job_id: str, audio_paths: list[Path], provider: str) -> None:
             update(progress_chars=chars, progress_step=step_name)
         return cb
 
+    audio_paths: list[Path] = []
     stitched_path: Optional[Path] = None
     try:
+        # 1) Download each R2 object to a local temp file.
+        update(status="downloading", step="downloading", progress_chars=0, progress_step=None)
+        for key, fname in zip(r2_keys, filenames):
+            suffix = Path(fname or "audio.webm").suffix or ".webm"
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            tmp.close()
+            _r2_download(key, Path(tmp.name))
+            audio_paths.append(Path(tmp.name))
+
         if len(audio_paths) > 1:
             update(status="stitching", step="stitching", progress_chars=0)
             stem = audio_paths[0].with_suffix("")
@@ -192,6 +255,7 @@ def _process_job(job_id: str, audio_paths: list[Path], provider: str) -> None:
             friendly = "Rate limit hit on a provider. Wait a minute and retry."
         update(status="failed", error=friendly, error_raw=raw[:2000], finished_at=time.time())
     finally:
+        # Clean up local temp files
         for p in audio_paths:
             try:
                 p.unlink(missing_ok=True)
@@ -202,6 +266,9 @@ def _process_job(job_id: str, audio_paths: list[Path], provider: str) -> None:
                 stitched_path.unlink(missing_ok=True)
             except Exception:
                 pass
+        # Clean up R2 objects (best-effort — they have a lifecycle rule too as a safety net)
+        for key in r2_keys:
+            _r2_delete(key)
 
 
 # ---------- routes ----------
@@ -211,31 +278,61 @@ def index():
     return INDEX_HTML
 
 
-@app.post("/jobs")
-async def create_job(
-    audio: list[UploadFile] = File(...),
-    provider: str = Form(...),
+@app.post("/upload-url")
+def get_upload_url(
+    payload: dict = Body(...),
     token: Optional[str] = Query(None),
 ):
+    """Mint a presigned PUT URL for the browser to upload one file directly to R2.
+
+    Request body: {"filename": "meeting.mp3", "content_type": "audio/mpeg"}
+    Response:     {"url": "https://...", "key": "uploads/<uuid>/meeting.mp3"}
+    """
     _check_token(token)
+    _require_r2()
+    filename = (payload.get("filename") or "audio.bin").replace("/", "_").replace("\\", "_")
+    content_type = payload.get("content_type") or "application/octet-stream"
+    key = f"uploads/{uuid.uuid4().hex}/{filename}"
+    s3 = _r2_client()
+    url = s3.generate_presigned_url(
+        "put_object",
+        Params={
+            "Bucket": R2_BUCKET_NAME,
+            "Key": key,
+            "ContentType": content_type,
+        },
+        ExpiresIn=3600,  # 1 hour to upload
+    )
+    return {"url": url, "key": key}
+
+
+@app.post("/jobs")
+def create_job(
+    payload: dict = Body(...),
+    token: Optional[str] = Query(None),
+):
+    """Create a processing job from already-uploaded R2 keys.
+
+    Request body:
+      {
+        "r2_keys": ["uploads/abc.../file1.mp3", "uploads/def.../file2.mp3"],
+        "filenames": ["file1.mp3", "file2.mp3"],
+        "provider": "deepgram" | "sarvam"
+      }
+    """
+    _check_token(token)
+    _require_r2()
+
+    provider = payload.get("provider")
+    r2_keys = payload.get("r2_keys") or []
+    filenames = payload.get("filenames") or [Path(k).name for k in r2_keys]
 
     if provider not in ("deepgram", "sarvam"):
         raise HTTPException(status_code=400, detail="provider must be 'deepgram' or 'sarvam'")
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured on server")
-    if not audio:
-        raise HTTPException(status_code=400, detail="at least one audio file required")
-
-    # Persist uploads to temp files in upload order. Background thread reads & deletes.
-    temp_paths: list[Path] = []
-    for idx, f in enumerate(audio):
-        suffix = Path(f.filename or f"audio_{idx}.webm").suffix or ".webm"
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        try:
-            tmp.write(await f.read())
-        finally:
-            tmp.close()
-        temp_paths.append(Path(tmp.name))
+    if not r2_keys:
+        raise HTTPException(status_code=400, detail="r2_keys must be a non-empty list")
 
     job_id = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
@@ -244,16 +341,15 @@ async def create_job(
             "provider": provider,
             "status": "queued",
             "step": None,
-            "n_files": len(temp_paths),
+            "n_files": len(r2_keys),
             "created_at": time.time(),
             "error": None,
         }
 
     thread = threading.Thread(
-        target=_process_job, args=(job_id, temp_paths, provider), daemon=True
+        target=_process_job, args=(job_id, r2_keys, filenames, provider), daemon=True
     )
     thread.start()
-
     return {"job_id": job_id}
 
 
@@ -663,35 +759,97 @@ $("resetBtn").addEventListener("click", () => {
 });
 
 // ---------- submit & poll ----------
+// Direct-to-R2 upload with progress, using XMLHttpRequest so we get upload events.
+function uploadFileToR2(file, presignedUrl, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", presignedUrl, true);
+    xhr.setRequestHeader("Content-Type", file.type || "application/octet-stream");
+    xhr.upload.addEventListener("progress", (e) => {
+      if (e.lengthComputable && onProgress) onProgress(e.loaded, e.total);
+    });
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      else reject(new Error(`R2 upload failed: ${xhr.status} ${xhr.responseText || ""}`));
+    };
+    xhr.onerror = () => reject(new Error("Network error during R2 upload"));
+    xhr.ontimeout = () => reject(new Error("R2 upload timed out"));
+    xhr.send(file);
+  });
+}
+
+async function getUploadUrl(file) {
+  const tokenParam = accessToken ? `?token=${encodeURIComponent(accessToken)}` : "";
+  const r = await fetch(`/upload-url${tokenParam}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      filename: file.name || "audio.webm",
+      content_type: file.type || "application/octet-stream",
+    }),
+  });
+  if (!r.ok) throw new Error("Could not get upload URL: " + (await r.text()));
+  return r.json(); // { url, key }
+}
+
 $("submitBtn").addEventListener("click", async () => {
   if (!finalFiles.length) return;
   $("submitBtn").disabled = true;
   $("error").style.display = "none";
   $("resultSection").style.display = "none";
   const provider = document.querySelector('input[name="provider"]:checked').value;
-  $("submitStatus").textContent = "Uploading…";
 
-  const fd = new FormData();
-  finalFiles.forEach((f, i) => {
-    fd.append("audio", f, f.name || `audio_${i}.webm`);
-  });
-  fd.append("provider", provider);
-
+  // Phase 1: upload each file directly to R2 with live progress
+  const totalBytes = finalFiles.reduce((s, f) => s + f.size, 0);
+  const fmtMB = (b) => (b / (1024 * 1024)).toFixed(1);
+  const keys = [];
+  const filenames = [];
   try {
-    const url = "/jobs" + (accessToken ? `?token=${encodeURIComponent(accessToken)}` : "");
-    const resp = await fetch(url, { method: "POST", body: fd });
-    if (!resp.ok) throw new Error(await resp.text());
-    const { job_id } = await resp.json();
+    let totalLoaded = 0;
+    for (let i = 0; i < finalFiles.length; i++) {
+      const f = finalFiles[i];
+      const { url, key } = await getUploadUrl(f);
+      let lastLoaded = 0;
+      await uploadFileToR2(f, url, (loaded) => {
+        const delta = loaded - lastLoaded;
+        lastLoaded = loaded;
+        totalLoaded += delta;
+        const pct = Math.min(100, Math.floor((totalLoaded / totalBytes) * 100));
+        $("submitStatus").textContent =
+          `Uploading file ${i + 1}/${finalFiles.length} — ${fmtMB(totalLoaded)} / ${fmtMB(totalBytes)} MB (${pct}%)`;
+      });
+      keys.push(key);
+      filenames.push(f.name || `audio_${i}.webm`);
+    }
+  } catch (err) {
+    showError("Upload failed: " + err.message);
+    $("submitBtn").disabled = false;
+    return;
+  }
+
+  // Phase 2: tell the server the keys are ready
+  $("submitStatus").textContent = "Uploads complete — starting job…";
+  try {
+    const tokenParam = accessToken ? `?token=${encodeURIComponent(accessToken)}` : "";
+    const r = await fetch(`/jobs${tokenParam}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ r2_keys: keys, filenames, provider }),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    const { job_id } = await r.json();
     $("submitStatus").textContent = `Job ${job_id} submitted. Processing…`;
     pollJob(job_id);
   } catch (err) {
-    showError("Upload failed: " + err.message);
+    showError("Could not start job: " + err.message);
     $("submitBtn").disabled = false;
   }
 });
 
 async function pollJob(jobId) {
   const stepLabel = {
+    queued: "Job queued",
+    downloading: "Fetching audio from storage",
     stitching: "Stitching audio files",
     transcribing: "Transcribing audio",
     extracting_detailed: "Extracting detailed minutes",
