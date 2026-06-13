@@ -25,6 +25,7 @@ Environment:
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -292,19 +293,19 @@ def _process_job(job_id: str, r2_keys: list[str], filenames: list[str], provider
             _r2_put_json(ck["detailed"], detailed_mom)
         detailed_md = base.render_markdown(detailed_mom)
 
-        # ---- Step 3: Concise MoM (skip if cached) ----
-        if not concise_mom:
-            update(status="condensing", step="mom_extraction_concise",
-                   progress_chars=0, progress_step="mom_extraction_concise")
-            concise_mom = base.condense_to_concise(detailed_mom, on_progress=make_progress("mom_extraction_concise"))
-            update(concise_mom=concise_mom)
-            _r2_put_json(ck["concise"], concise_mom)
-        concise_md = base.render_markdown(concise_mom)
+        # ---- Step 3: Concise MoM is now opt-in via POST /jobs/{id}/condense ----
+        # We skip it in the main pipeline. If a previous run already cached one
+        # (e.g. resuming from R2), still surface it; otherwise leave it None.
+        concise_md = base.render_markdown(concise_mom) if concise_mom else None
 
-        # Render both docx (template metadata auto-derived from the MoM itself)
+        # Render detailed docx. Concise docx only if we already have a concise MoM
+        # (i.e. a previous /condense call populated it).
         update(status="rendering_docx", step="docx_rendering", progress_chars=None, progress_step=None)
         detailed_docx = fill_template_to_bytes(DEFAULT_TEMPLATE, detailed_mom, auto_meta(detailed_mom))
-        concise_docx = fill_template_to_bytes(DEFAULT_TEMPLATE, concise_mom, auto_meta(concise_mom))
+        concise_docx = (
+            fill_template_to_bytes(DEFAULT_TEMPLATE, concise_mom, auto_meta(concise_mom))
+            if concise_mom else None
+        )
 
         update(
             status="done",
@@ -324,7 +325,7 @@ def _process_job(job_id: str, r2_keys: list[str], filenames: list[str], provider
         import traceback
         tb = traceback.format_exc()
         # Always print the full traceback to stdout so it shows up in Render logs.
-        print(tb, file=sys.stderr if False else __import__("sys").stderr, flush=True)
+        print(tb, file=sys.stderr, flush=True)
         # Friendly-ify common provider errors so the UI isn't a wall of HTTP headers.
         raw = str(e)
         friendly = raw
@@ -488,6 +489,80 @@ def get_result(job_id: str, token: Optional[str] = Query(None)):
                 "markdown": job.get("concise_markdown"),
             },
         })
+
+
+def _condense_job(job_id: str) -> None:
+    """Background worker that runs the condense pass + renders the concise docx.
+    Idempotent: skips if concise outputs already exist on the job."""
+    def update(**fields):
+        with JOBS_LOCK:
+            if job_id in JOBS:
+                JOBS[job_id].update(fields)
+
+    last_emit = {"t": 0.0}
+    def progress(chars: int):
+        now = time.time()
+        if now - last_emit["t"] < 0.5:
+            return
+        last_emit["t"] = now
+        update(condense_progress_chars=chars)
+
+    try:
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            detailed_mom = job and job.get("detailed_mom")
+        if not detailed_mom:
+            ck = _cache_keys(job_id)
+            detailed_mom = _r2_get_json(ck["detailed"])
+        if not detailed_mom:
+            update(condense_status="failed", condense_error="No detailed MoM available to condense from.")
+            return
+
+        update(condense_status="running", condense_progress_chars=0)
+        concise_mom = base.condense_to_concise(detailed_mom, on_progress=progress)
+        concise_md = base.render_markdown(concise_mom)
+        concise_docx = fill_template_to_bytes(DEFAULT_TEMPLATE, concise_mom, auto_meta(concise_mom))
+
+        # Persist to R2 cache for resumability
+        ck = _cache_keys(job_id)
+        _r2_put_json(ck["concise"], concise_mom)
+
+        update(
+            concise_status="done",
+            condense_status="done",
+            condense_progress_chars=None,
+            concise_mom=concise_mom,
+            concise_markdown=concise_md,
+            concise_docx=concise_docx,
+        )
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr, flush=True)
+        update(condense_status="failed", condense_error=str(e), condense_error_raw=tb[:4000])
+
+
+@app.post("/jobs/{job_id}/condense")
+def start_condense(job_id: str, token: Optional[str] = Query(None)):
+    """Generate the concise MoM + docx on demand. Cheap pass (~₹6 / 2 min)."""
+    _check_token(token)
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="job not found")
+        if job.get("status") != "done":
+            raise HTTPException(status_code=409, detail=f"main job not finished (status: {job.get('status')})")
+        if job.get("concise_mom"):
+            return {"status": "done", "already": True}
+        if job.get("condense_status") == "running":
+            return {"status": "running", "already": True}
+        job["condense_status"] = "queued"
+        job["condense_progress_chars"] = 0
+        job.pop("condense_error", None)
+
+    thread = threading.Thread(target=_condense_job, args=(job_id,), daemon=True)
+    thread.start()
+    return {"status": "queued"}
 
 
 @app.post("/jobs/{job_id}/retry")
@@ -1056,11 +1131,47 @@ async function loadResult(jobId) {
 function renderStyle(style) {
   if (!resultData) return;
   const block = resultData[style] || {};
-  $("momMd").textContent = block.markdown || "";
-  // Build the download row inline: markdown + json + docx for the active style
-  const tokenParam = accessToken ? `?token=${encodeURIComponent(accessToken)}` : "";
   const dl = $("momDownloads");
   dl.innerHTML = "";
+
+  if (style === "concise" && !block.mom) {
+    // No concise version yet — show the on-demand generation UI
+    $("momMd").textContent = "";
+    const wrap = document.createElement("div");
+    wrap.style.cssText = "padding: 24px; text-align: center;";
+    const note = document.createElement("div");
+    note.style.cssText = "color: var(--muted); font-size: 14px; margin-bottom: 12px; line-height: 1.5;";
+    note.innerHTML = "A concise version is a tightened, client-friendly rewrite of the detailed MoM.<br>Skips redundant detail, merges related sign-offs. Takes ~2 minutes and costs roughly ₹6 in Claude tokens.";
+    const btn = document.createElement("button");
+    btn.textContent = "Generate concise version";
+    btn.className = "primary";
+    btn.id = "genConciseBtn";
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      btn.textContent = "Starting…";
+      try {
+        const tokenParam = accessToken ? `?token=${encodeURIComponent(accessToken)}` : "";
+        const r = await fetch(`/jobs/${currentJobId}/condense${tokenParam}`, { method: "POST" });
+        if (!r.ok) throw new Error(await r.text());
+        pollCondense();
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = "Generate concise version";
+        const e = document.createElement("div");
+        e.style.cssText = "color: var(--danger); margin-top: 10px; font-size: 13px;";
+        e.textContent = "Failed: " + err.message;
+        wrap.appendChild(e);
+      }
+    });
+    wrap.appendChild(note);
+    wrap.appendChild(btn);
+    $("momMd").innerHTML = "";
+    $("momMd").appendChild(wrap);
+    return;
+  }
+
+  $("momMd").textContent = block.markdown || "";
+  const tokenParam = accessToken ? `?token=${encodeURIComponent(accessToken)}` : "";
   function addLink(href, label, dlname) {
     const a = document.createElement("a");
     a.href = href;
@@ -1071,6 +1182,44 @@ function renderStyle(style) {
   addLink(textBlobUrl(block.markdown || ""), `Download ${style} MoM (markdown)`, `mom_${style}.md`);
   addLink(textBlobUrl(JSON.stringify(block.mom || {}, null, 2), "application/json"), `Download ${style} MoM (json)`, `mom_${style}.json`);
   addLink(`/jobs/${currentJobId}/docx?style=${style}${tokenParam ? "&" + tokenParam.slice(1) : ""}`, `Download ${style} MoM (Word)`, `mom_${style}.docx`);
+}
+
+async function pollCondense() {
+  const tokenParam = accessToken ? `?token=${encodeURIComponent(accessToken)}` : "";
+  const btn = $("genConciseBtn");
+  const t0 = Date.now();
+  while (true) {
+    try {
+      const r = await fetch(`/jobs/${currentJobId}${tokenParam}`);
+      if (!r.ok) throw new Error(await r.text());
+      const job = await r.json();
+      const elapsed = Math.floor((Date.now() - t0) / 1000);
+      const elapsedStr = `${Math.floor(elapsed/60)}:${String(elapsed%60).padStart(2,"0")}`;
+      const chars = job.condense_progress_chars || 0;
+      if (btn) {
+        btn.textContent = chars > 0
+          ? `Condensing… ${elapsedStr} elapsed — ${chars.toLocaleString()} chars streamed`
+          : `Condensing… ${elapsedStr} elapsed`;
+      }
+      if (job.condense_status === "done") {
+        // Reload the full result to get the new concise content + docx
+        await loadResult(currentJobId);
+        renderStyle("concise");
+        return;
+      }
+      if (job.condense_status === "failed") {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = "Generate concise version";
+        }
+        showError("Concise generation failed: " + (job.condense_error || "unknown"));
+        return;
+      }
+    } catch (err) {
+      // Transient; try again
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
 }
 
 document.querySelectorAll(".style-tab").forEach((b) => {
