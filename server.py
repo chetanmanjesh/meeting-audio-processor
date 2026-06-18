@@ -168,7 +168,136 @@ def _cache_keys(job_id: str) -> dict:
         "transcript": f"cache/{job_id}/transcript.txt",
         "detailed":   f"cache/{job_id}/detailed.json",
         "concise":    f"cache/{job_id}/concise.json",
+        "samples":    f"cache/{job_id}/speaker_samples.json",
     }
+
+
+# ---------- Speaker sample extraction (for the Identify Speakers feature) ----------
+
+def _r2_put_file(key: str, local_path: Path, content_type: str = "application/octet-stream") -> bool:
+    try:
+        s3 = _r2_client()
+        if not s3:
+            return False
+        s3.upload_file(str(local_path), R2_BUCKET_NAME, key, ExtraArgs={"ContentType": content_type})
+        return True
+    except Exception:
+        return False
+
+
+def _extract_speaker_samples(transcript_response, provider: str, audio_path: Path, job_id: str) -> dict:
+    """Find the longest contiguous run per speaker, clip ~8s from it, upload to R2.
+
+    Returns: {label: {key, start_s, end_s, duration_s}} keyed by 'Speaker N'.
+    Best-effort — failures during clipping are swallowed; the feature just won't
+    be available for speakers we couldn't sample.
+    """
+    # Gather (speaker_id, start_s, end_s) for each contiguous run.
+    runs: list[tuple] = []
+    if provider == "deepgram":
+        try:
+            words = (transcript_response.get("results", {})
+                                       .get("channels", [{}])[0]
+                                       .get("alternatives", [{}])[0]
+                                       .get("words", []) or [])
+        except Exception:
+            words = []
+        if words:
+            cur_spk = words[0].get("speaker", 0)
+            cur_start = float(words[0].get("start", 0.0))
+            cur_end = float(words[0].get("end", cur_start))
+            for w in words[1:]:
+                spk = w.get("speaker", 0)
+                if spk == cur_spk:
+                    cur_end = float(w.get("end", cur_end))
+                else:
+                    runs.append((cur_spk, cur_start, cur_end))
+                    cur_spk = spk
+                    cur_start = float(w.get("start", 0.0))
+                    cur_end = float(w.get("end", cur_start))
+            runs.append((cur_spk, cur_start, cur_end))
+    else:  # sarvam
+        def _find_segs(d):
+            if isinstance(d, dict):
+                for k, v in d.items():
+                    if isinstance(v, list) and v and isinstance(v[0], dict) and "start_time_seconds" in v[0]:
+                        return v
+                    r = _find_segs(v)
+                    if r:
+                        return r
+            return None
+        segs = _find_segs(transcript_response) or []
+        for s in segs:
+            try:
+                runs.append((
+                    str(s.get("speaker_id", 0)),
+                    float(s.get("start_time_seconds", 0.0)),
+                    float(s.get("end_time_seconds", 0.0)),
+                ))
+            except Exception:
+                continue
+
+    # Pick the longest run per speaker.
+    best: dict = {}
+    for spk, start, end in runs:
+        duration = end - start
+        if spk not in best or duration > (best[spk][1] - best[spk][0]):
+            best[spk] = (start, end)
+
+    samples: dict = {}
+    for spk, (start, end) in best.items():
+        end = min(end, start + 8.0)  # cap clip length
+        if end - start < 1.5:  # too short to be useful
+            continue
+        sample_key = f"samples/{job_id}/speaker_{spk}.mp3"
+        clip_fd, clip_name = tempfile.mkstemp(suffix=".mp3")
+        os.close(clip_fd)
+        clip_path = Path(clip_name)
+        try:
+            subprocess.run(
+                [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+                 "-ss", f"{start:.2f}", "-to", f"{end:.2f}",
+                 "-i", str(audio_path),
+                 "-vn", "-ac", "1", "-b:a", "48k",
+                 str(clip_path)],
+                check=True, timeout=30,
+            )
+            if _r2_put_file(sample_key, clip_path, content_type="audio/mpeg"):
+                samples[f"Speaker {spk}"] = {
+                    "key": sample_key,
+                    "start_s": round(start, 2),
+                    "end_s": round(end, 2),
+                    "duration_s": round(end - start, 2),
+                }
+        except Exception:
+            pass
+        finally:
+            clip_path.unlink(missing_ok=True)
+
+    return samples
+
+
+# ---------- Speaker-name mapping helpers ----------
+
+def _apply_mapping_to_str(s: str, mapping: dict) -> str:
+    if not s or not mapping:
+        return s
+    # Replace in length order (longer labels first) so "Speaker 10" doesn't get
+    # half-replaced by a "Speaker 1" rule.
+    out = s
+    for label in sorted(mapping.keys(), key=len, reverse=True):
+        out = out.replace(label, mapping[label])
+    return out
+
+
+def _apply_mapping_to_obj(obj, mapping: dict):
+    if isinstance(obj, str):
+        return _apply_mapping_to_str(obj, mapping)
+    if isinstance(obj, list):
+        return [_apply_mapping_to_obj(x, mapping) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _apply_mapping_to_obj(v, mapping) for k, v in obj.items()}
+    return obj
 
 
 def stitch_files(audio_paths: list[Path], out_stem: Path) -> Path:
@@ -249,6 +378,7 @@ def _process_job(job_id: str, r2_keys: list[str], filenames: list[str], provider
     transcript = job_snapshot.get("transcript") or _r2_get_text(ck["transcript"])
     detailed_mom = job_snapshot.get("detailed_mom") or _r2_get_json(ck["detailed"])
     concise_mom = job_snapshot.get("concise_mom") or _r2_get_json(ck["concise"])
+    speaker_samples = job_snapshot.get("speaker_samples") or _r2_get_json(ck["samples"]) or {}
 
     try:
         # ---- Step 1: Download + transcribe (skip if cached) ----
@@ -270,19 +400,33 @@ def _process_job(job_id: str, r2_keys: list[str], filenames: list[str], provider
                 audio_to_process = audio_paths[0]
 
             update(status="transcribing", step="transcription", progress_chars=0, progress_step=None)
+            asr_response = None
             if provider == "deepgram":
                 if not os.environ.get("DEEPGRAM_API_KEY"):
                     raise RuntimeError("DEEPGRAM_API_KEY not set on server")
-                dg = base.transcribe(audio_to_process, timeout_seconds=1800.0)
-                transcript = base.format_transcript(dg)
+                asr_response = base.transcribe(audio_to_process, timeout_seconds=1800.0)
+                transcript = base.format_transcript(asr_response)
             else:
                 if not os.environ.get("SARVAM_API_KEY"):
                     raise RuntimeError("SARVAM_API_KEY not set on server")
-                sv = sarvam_pipeline.transcribe_sarvam(audio_to_process)
-                transcript = sarvam_pipeline.format_sarvam_transcript(sv)
+                asr_response = sarvam_pipeline.transcribe_sarvam(audio_to_process)
+                transcript = sarvam_pipeline.format_sarvam_transcript(asr_response)
 
             update(transcript=transcript)
             _r2_put_text(ck["transcript"], transcript)
+
+            # Extract per-speaker audio samples while we still have the local file.
+            # Best-effort: failures here don't fail the job.
+            if not speaker_samples and asr_response is not None:
+                try:
+                    speaker_samples = _extract_speaker_samples(
+                        asr_response, provider, audio_to_process, job_id
+                    )
+                    if speaker_samples:
+                        update(speaker_samples=speaker_samples)
+                        _r2_put_json(ck["samples"], speaker_samples)
+                except Exception as e:
+                    print(f"Speaker sample extraction skipped: {e}", file=sys.stderr)
 
         # ---- Step 2: Detailed MoM (skip if cached) ----
         if not detailed_mom:
@@ -360,8 +504,12 @@ def _process_job(job_id: str, r2_keys: list[str], filenames: list[str], provider
         if final_status == "done":
             for key in r2_keys:
                 _r2_delete(key)
-            for k in _cache_keys(job_id).values():
-                _r2_delete(k)
+            # Delete transcript/detailed/concise cache on success.
+            # Keep speaker_samples.json + the samples/{job_id}/*.mp3 clips
+            # around so the Identify-Speakers UI works on the result page.
+            ck = _cache_keys(job_id)
+            for cache_kind in ("transcript", "detailed", "concise"):
+                _r2_delete(ck[cache_kind])
 
 
 # ---------- routes ----------
@@ -453,6 +601,10 @@ _HEAVY_KEYS = {
     "transcript", "detailed_mom", "detailed_markdown", "concise_mom",
     "concise_markdown", "detailed_docx", "concise_docx",
     "_r2_keys", "_filenames",
+    "speaker_samples",
+    "_original_transcript", "_original_detailed_mom", "_original_detailed_markdown",
+    "_original_detailed_docx", "_original_concise_mom", "_original_concise_markdown",
+    "_original_concise_docx",
 }
 
 
@@ -611,6 +763,135 @@ def retry_job(job_id: str, token: Optional[str] = Query(None)):
     return {"job_id": job_id, "status": "queued"}
 
 
+@app.get("/jobs/{job_id}/speaker-samples")
+def get_speaker_samples(job_id: str, token: Optional[str] = Query(None)):
+    """Return presigned GET URLs for each speaker's audio sample, plus any
+    existing speaker-name mapping."""
+    _check_token(token)
+    _require_r2()
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="job not found")
+        samples = dict(job.get("speaker_samples") or {})
+        mapping = dict(job.get("speaker_mapping") or {})
+
+    s3 = _r2_client()
+    speakers = []
+    for label, info in samples.items():
+        try:
+            url = s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": R2_BUCKET_NAME, "Key": info["key"]},
+                ExpiresIn=3600,
+            )
+        except Exception:
+            url = None
+        speakers.append({
+            "label": label,
+            "current_name": mapping.get(label, ""),
+            "audio_url": url,
+            "start_s": info.get("start_s"),
+            "end_s": info.get("end_s"),
+            "duration_s": info.get("duration_s"),
+        })
+    # Sort by label so "Speaker 0", "Speaker 1", "Speaker 2" come in order.
+    speakers.sort(key=lambda s: s["label"])
+    return {"speakers": speakers, "mapping": mapping}
+
+
+def _apply_speaker_mapping_and_rerender(job_id: str, mapping: dict) -> dict:
+    """Apply name mapping to transcript + detailed/concise MoM (if present),
+    re-render markdown + docx. Caches originals on first call. Returns the
+    updated field dict (kept caller-side for atomic JOBS update)."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="job not found")
+
+        # Cache originals once so /reset-speakers can restore them.
+        if "_original_transcript" not in job:
+            job["_original_transcript"] = job.get("transcript")
+            job["_original_detailed_mom"] = job.get("detailed_mom")
+            job["_original_detailed_markdown"] = job.get("detailed_markdown")
+            job["_original_detailed_docx"] = job.get("detailed_docx")
+            if job.get("concise_mom"):
+                job["_original_concise_mom"] = job.get("concise_mom")
+                job["_original_concise_markdown"] = job.get("concise_markdown")
+                job["_original_concise_docx"] = job.get("concise_docx")
+
+        orig_transcript = job.get("_original_transcript")
+        orig_detailed = job.get("_original_detailed_mom")
+        orig_concise = job.get("_original_concise_mom")
+
+    new_transcript = _apply_mapping_to_str(orig_transcript or "", mapping)
+    new_detailed_mom = _apply_mapping_to_obj(orig_detailed, mapping) if orig_detailed else None
+    new_concise_mom = _apply_mapping_to_obj(orig_concise, mapping) if orig_concise else None
+
+    updates: dict = {
+        "transcript": new_transcript,
+        "speaker_mapping": mapping,
+    }
+    if new_detailed_mom:
+        updates["detailed_mom"] = new_detailed_mom
+        updates["detailed_markdown"] = base.render_markdown(new_detailed_mom)
+        updates["detailed_docx"] = fill_template_to_bytes(
+            DEFAULT_TEMPLATE, new_detailed_mom, auto_meta(new_detailed_mom)
+        )
+    if new_concise_mom:
+        updates["concise_mom"] = new_concise_mom
+        updates["concise_markdown"] = base.render_markdown(new_concise_mom)
+        updates["concise_docx"] = fill_template_to_bytes(
+            DEFAULT_TEMPLATE, new_concise_mom, auto_meta(new_concise_mom)
+        )
+    return updates
+
+
+@app.post("/jobs/{job_id}/identify-speakers")
+def identify_speakers(job_id: str, payload: dict = Body(...), token: Optional[str] = Query(None)):
+    """Apply a {label: name} mapping to all outputs.
+
+    Body: {"mapping": {"Speaker 0": "Priya", "Speaker 1": "Rohit"}}
+    Empty/blank names in the mapping are ignored — that speaker keeps the
+    label as-is.
+    """
+    _check_token(token)
+    raw = payload.get("mapping") or {}
+    mapping = {k: v.strip() for k, v in raw.items() if isinstance(v, str) and v.strip()}
+
+    updates = _apply_speaker_mapping_and_rerender(job_id, mapping)
+    with JOBS_LOCK:
+        JOBS[job_id].update(updates)
+    return {
+        "status": "ok",
+        "mapping": mapping,
+        "detailed_updated": "detailed_mom" in updates,
+        "concise_updated": "concise_mom" in updates,
+    }
+
+
+@app.post("/jobs/{job_id}/reset-speakers")
+def reset_speakers(job_id: str, token: Optional[str] = Query(None)):
+    """Restore the original Speaker N labels (undo a previous identify call)."""
+    _check_token(token)
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="job not found")
+        if "_original_detailed_mom" not in job:
+            return {"status": "ok", "noop": True}
+        job["transcript"] = job["_original_transcript"]
+        job["detailed_mom"] = job["_original_detailed_mom"]
+        job["detailed_markdown"] = job["_original_detailed_markdown"]
+        job["detailed_docx"] = job["_original_detailed_docx"]
+        if "_original_concise_mom" in job:
+            job["concise_mom"] = job["_original_concise_mom"]
+            job["concise_markdown"] = job["_original_concise_markdown"]
+            job["concise_docx"] = job["_original_concise_docx"]
+        job["speaker_mapping"] = {}
+    return {"status": "ok"}
+
+
 @app.get("/jobs/{job_id}/docx")
 def get_docx(job_id: str, style: str = Query("detailed"), token: Optional[str] = Query(None)):
     """Stream the rendered docx for a finished job. ?style=detailed|concise"""
@@ -760,10 +1041,16 @@ INDEX_HTML = r"""<!doctype html>
   <section id="resultSection" style="display:none;">
     <h2>4. Results</h2>
     <div class="result">
-      <div class="style-tabs">
-        <button class="style-tab active" data-style="detailed">Detailed</button>
-        <button class="style-tab" data-style="concise">Concise</button>
+      <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+        <div class="style-tabs">
+          <button class="style-tab active" data-style="detailed">Detailed</button>
+          <button class="style-tab" data-style="concise">Concise</button>
+        </div>
+        <button id="identifyBtn" type="button" style="margin-left:auto;">
+          🗣 Identify speakers
+        </button>
       </div>
+      <div id="speakerMapBadge" style="display:none; margin:8px 0; font-size:13px; color:var(--muted);"></div>
       <h3>Minutes of meeting</h3>
       <pre id="momMd"></pre>
       <div class="download-row" id="momDownloads"></div>
@@ -774,6 +1061,25 @@ INDEX_HTML = r"""<!doctype html>
       </div>
     </div>
   </section>
+
+  <!-- Speaker identification modal -->
+  <div id="speakerModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center; padding:20px;">
+    <div style="background:white; border-radius:12px; max-width:600px; width:100%; max-height:90vh; overflow:auto; padding:24px;">
+      <div style="display:flex; justify-content:space-between; align-items:start; margin-bottom:8px;">
+        <div>
+          <h2 style="margin:0 0 4px; font-size:18px;">Identify speakers</h2>
+          <div style="color:var(--muted); font-size:13px;">Play each clip and type the speaker's name. Save to replace 'Speaker N' labels across the MoM, transcript, and downloadable files. You can reset anytime.</div>
+        </div>
+        <button id="speakerModalClose" type="button" style="border:none; background:none; font-size:24px; line-height:1; cursor:pointer; color:var(--muted); padding:0 4px;">×</button>
+      </div>
+      <div id="speakerList" style="margin-top:16px; display:flex; flex-direction:column; gap:14px;"></div>
+      <div id="speakerError" class="error" style="display:none; margin-top:12px;"></div>
+      <div style="display:flex; gap:10px; margin-top:18px; justify-content:flex-end;">
+        <button id="speakerResetBtn" type="button" class="danger" style="display:none;">↺ Reset to Speaker IDs</button>
+        <button id="speakerSaveBtn" type="button" class="primary">Save names</button>
+      </div>
+    </div>
+  </div>
 </main>
 
 <script>
@@ -1273,6 +1579,156 @@ function showErrorWithRetry(jobId, msg) {
   e.appendChild(btn);
   e.style.display = "block";
 }
+
+// ---------- Speaker identification ----------
+
+function updateSpeakerBadge(mapping) {
+  const badge = $("speakerMapBadge");
+  const entries = Object.entries(mapping || {});
+  if (entries.length === 0) {
+    badge.style.display = "none";
+    return;
+  }
+  const txt = entries.map(([label, name]) => `${label} → ${name}`).join(", ");
+  badge.textContent = `Speakers identified: ${txt}`;
+  badge.style.display = "block";
+}
+
+async function openSpeakerModal() {
+  if (!currentJobId) return;
+  const modal = $("speakerModal");
+  const list = $("speakerList");
+  const err = $("speakerError");
+  const resetBtn = $("speakerResetBtn");
+  err.style.display = "none";
+  list.innerHTML = "<div style='color:var(--muted); font-size:14px;'>Loading speaker samples…</div>";
+  modal.style.display = "flex";
+  try {
+    const tokenParam = accessToken ? `?token=${encodeURIComponent(accessToken)}` : "";
+    const r = await fetch(`/jobs/${currentJobId}/speaker-samples${tokenParam}`);
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    list.innerHTML = "";
+    if (!data.speakers || data.speakers.length === 0) {
+      list.innerHTML = "<div style='color:var(--muted); font-size:14px;'>No speaker samples were captured for this meeting.</div>";
+      resetBtn.style.display = "none";
+      return;
+    }
+    data.speakers.forEach((spk) => {
+      const row = document.createElement("div");
+      row.style.cssText = "background:#faf8f3; border:1px solid var(--border); border-radius:8px; padding:12px;";
+      const head = document.createElement("div");
+      head.style.cssText = "display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;";
+      const label = document.createElement("div");
+      label.innerHTML = `<strong>${spk.label}</strong> <span style="color:var(--muted); font-size:12px;">— ${spk.duration_s}s sample from ${Math.floor(spk.start_s)}s in</span>`;
+      head.appendChild(label);
+      row.appendChild(head);
+      if (spk.audio_url) {
+        const audio = document.createElement("audio");
+        audio.controls = true;
+        audio.preload = "none";
+        audio.src = spk.audio_url;
+        audio.style.cssText = "width:100%; height:32px;";
+        row.appendChild(audio);
+      }
+      const input = document.createElement("input");
+      input.type = "text";
+      input.placeholder = "Name (leave blank to keep as Speaker N)";
+      input.value = spk.current_name || "";
+      input.dataset.label = spk.label;
+      input.style.cssText = "width:100%; margin-top:8px; padding:8px 10px; border:1px solid var(--border); border-radius:6px; font:inherit;";
+      row.appendChild(input);
+      list.appendChild(row);
+    });
+    resetBtn.style.display = Object.keys(data.mapping || {}).length > 0 ? "inline-block" : "none";
+  } catch (e) {
+    list.innerHTML = "";
+    err.textContent = "Could not load speaker samples: " + e.message;
+    err.style.display = "block";
+  }
+}
+
+function closeSpeakerModal() {
+  $("speakerModal").style.display = "none";
+}
+
+async function saveSpeakerMapping() {
+  const inputs = document.querySelectorAll("#speakerList input[type='text']");
+  const mapping = {};
+  inputs.forEach((inp) => {
+    const v = inp.value.trim();
+    if (v) mapping[inp.dataset.label] = v;
+  });
+  const btn = $("speakerSaveBtn");
+  const err = $("speakerError");
+  err.style.display = "none";
+  btn.disabled = true;
+  btn.textContent = "Saving…";
+  try {
+    const tokenParam = accessToken ? `?token=${encodeURIComponent(accessToken)}` : "";
+    const r = await fetch(`/jobs/${currentJobId}/identify-speakers${tokenParam}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mapping }),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    // Reload the result so the new mapping flows through to UI + downloads.
+    closeSpeakerModal();
+    await loadResult(currentJobId);
+    updateSpeakerBadge(mapping);
+  } catch (e) {
+    err.textContent = "Save failed: " + e.message;
+    err.style.display = "block";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Save names";
+  }
+}
+
+async function resetSpeakerMapping() {
+  const btn = $("speakerResetBtn");
+  const err = $("speakerError");
+  err.style.display = "none";
+  btn.disabled = true;
+  btn.textContent = "Resetting…";
+  try {
+    const tokenParam = accessToken ? `?token=${encodeURIComponent(accessToken)}` : "";
+    const r = await fetch(`/jobs/${currentJobId}/reset-speakers${tokenParam}`, { method: "POST" });
+    if (!r.ok) throw new Error(await r.text());
+    closeSpeakerModal();
+    await loadResult(currentJobId);
+    updateSpeakerBadge({});
+  } catch (e) {
+    err.textContent = "Reset failed: " + e.message;
+    err.style.display = "block";
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "↺ Reset to Speaker IDs";
+  }
+}
+
+$("identifyBtn").addEventListener("click", openSpeakerModal);
+$("speakerModalClose").addEventListener("click", closeSpeakerModal);
+$("speakerSaveBtn").addEventListener("click", saveSpeakerMapping);
+$("speakerResetBtn").addEventListener("click", resetSpeakerMapping);
+$("speakerModal").addEventListener("click", (e) => {
+  if (e.target === $("speakerModal")) closeSpeakerModal();
+});
+
+// Surface any existing speaker mapping when result loads
+const _originalLoadResult = loadResult;
+loadResult = async function(jobId) {
+  await _originalLoadResult(jobId);
+  // Pull current mapping from the result for badge display
+  try {
+    const tokenParam = accessToken ? `?token=${encodeURIComponent(accessToken)}` : "";
+    const r = await fetch(`/jobs/${jobId}/speaker-samples${tokenParam}`);
+    if (r.ok) {
+      const data = await r.json();
+      updateSpeakerBadge(data.mapping || {});
+    }
+  } catch (e) { /* non-fatal */ }
+};
 </script>
 </body>
 </html>
