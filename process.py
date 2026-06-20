@@ -30,6 +30,12 @@ load_dotenv()
 
 CLAUDE_MODEL = "claude-sonnet-4-6"
 
+# LLM provider switch — controls extract_mom() and condense_to_concise().
+# "claude" (default): uses Anthropic Sonnet. ~₹25 per meeting.
+# "gemini":          uses Google Gemini Flash 2.0. Free at 1,500 req/day.
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "claude").strip().lower()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+
 MOM_SYSTEM_PROMPT = """You extract DETAILED, GRANULAR, and WELL-STRUCTURED minutes of meetings (MoM) from diarized transcripts of design / construction / project meetings.
 
 GOAL: Produce a MoM that a busy client can SKIM in 60 seconds and a project team can REFER to for ground truth. Both audiences matter.
@@ -204,16 +210,26 @@ def format_transcript(dg_response: dict) -> str:
     return "\n\n".join(lines)
 
 
-def extract_mom(transcript: str, on_progress=None) -> dict:
-    """Stream MoM extraction from Claude. on_progress(chars_so_far) called as tokens arrive."""
+def _strip_json_fences(text: str) -> str:
+    """Strip markdown fences a model may have wrapped the JSON in."""
+    text = text.strip()
+    if text.startswith("```"):
+        # Drop the opening fence (with optional language tag) and the closing fence.
+        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        if text.startswith("json\n"):
+            text = text[5:]
+    return text
+
+
+def _claude_stream_json(system_prompt: str, user_content: str, max_tokens: int, on_progress=None) -> dict:
+    """Stream a JSON response from Claude and parse it."""
     client = Anthropic()
-    print("→ Extracting MoM with Claude (streaming)...", file=sys.stderr)
     pieces = []
     with client.messages.stream(
         model=CLAUDE_MODEL,
-        max_tokens=16384,
-        system=MOM_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": f"Transcript:\n\n{transcript}"}],
+        max_tokens=max_tokens,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_content}],
     ) as stream:
         for text in stream.text_stream:
             pieces.append(text)
@@ -222,13 +238,70 @@ def extract_mom(transcript: str, on_progress=None) -> dict:
                     on_progress(sum(len(p) for p in pieces))
                 except Exception:
                     pass
-    text = "".join(pieces).strip()
-    # Strip markdown fences if Claude added them
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-        if text.startswith("json\n"):
-            text = text[5:]
-    return json.loads(text)
+    return json.loads(_strip_json_fences("".join(pieces)))
+
+
+def _gemini_stream_json(system_prompt: str, user_content: str, max_tokens: int, on_progress=None) -> dict:
+    """Stream a JSON response from Gemini Flash and parse it.
+
+    Uses response_mime_type='application/json' so Gemini constrains the output
+    to a JSON value (no markdown fences). System instruction holds the schema.
+    """
+    try:
+        from google import genai
+        from google.genai import types as gtypes
+    except ImportError as e:
+        raise RuntimeError(
+            "google-genai not installed. `pip install google-genai` first."
+        ) from e
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not set on server (LLM_PROVIDER=gemini requires it).")
+    client = genai.Client(api_key=api_key)
+    cfg = gtypes.GenerateContentConfig(
+        system_instruction=system_prompt,
+        response_mime_type="application/json",
+        max_output_tokens=max_tokens,
+        temperature=0.2,
+    )
+    pieces = []
+    stream = client.models.generate_content_stream(
+        model=GEMINI_MODEL,
+        contents=user_content,
+        config=cfg,
+    )
+    for chunk in stream:
+        try:
+            t = chunk.text
+        except Exception:
+            t = None
+        if not t:
+            continue
+        pieces.append(t)
+        if on_progress:
+            try:
+                on_progress(sum(len(p) for p in pieces))
+            except Exception:
+                pass
+    return json.loads(_strip_json_fences("".join(pieces)))
+
+
+def _llm_stream_json(system_prompt: str, user_content: str, max_tokens: int, on_progress=None) -> dict:
+    """Dispatch to the configured LLM provider."""
+    if LLM_PROVIDER == "gemini":
+        return _gemini_stream_json(system_prompt, user_content, max_tokens, on_progress)
+    return _claude_stream_json(system_prompt, user_content, max_tokens, on_progress)
+
+
+def extract_mom(transcript: str, on_progress=None) -> dict:
+    """Stream MoM extraction from the configured LLM. on_progress(chars_so_far) called as tokens arrive."""
+    print(f"→ Extracting MoM with {LLM_PROVIDER.title()} (streaming)...", file=sys.stderr)
+    return _llm_stream_json(
+        MOM_SYSTEM_PROMPT,
+        f"Transcript:\n\n{transcript}",
+        max_tokens=16384,
+        on_progress=on_progress,
+    )
 
 
 CONCISE_SYSTEM_PROMPT = """You receive a DETAILED minutes-of-meeting (MoM) JSON object. Produce an AGGRESSIVELY CONCISE version in the SAME JSON schema, by (a) tightening prose AND (b) MERGING items that state the same fact in different ways.
@@ -286,28 +359,13 @@ Return ONLY the concise JSON object. No commentary, no markdown fences."""
 
 def condense_to_concise(detailed_mom: dict, on_progress=None) -> dict:
     """Take a detailed MoM and produce a concise version (no facts dropped, tighter prose)."""
-    client = Anthropic()
-    print("→ Condensing to concise MoM with Claude (streaming)...", file=sys.stderr)
-    pieces = []
-    with client.messages.stream(
-        model=CLAUDE_MODEL,
+    print(f"→ Condensing to concise MoM with {LLM_PROVIDER.title()} (streaming)...", file=sys.stderr)
+    return _llm_stream_json(
+        CONCISE_SYSTEM_PROMPT,
+        f"Detailed MoM JSON:\n\n{json.dumps(detailed_mom, ensure_ascii=False)}",
         max_tokens=16384,
-        system=CONCISE_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": f"Detailed MoM JSON:\n\n{json.dumps(detailed_mom, ensure_ascii=False)}"}],
-    ) as stream:
-        for text in stream.text_stream:
-            pieces.append(text)
-            if on_progress:
-                try:
-                    on_progress(sum(len(p) for p in pieces))
-                except Exception:
-                    pass
-    text = "".join(pieces).strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-        if text.startswith("json\n"):
-            text = text[5:]
-    return json.loads(text)
+        on_progress=on_progress,
+    )
 
 
 def render_markdown(mom: dict) -> str:

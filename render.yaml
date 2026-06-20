@@ -23,5 +23,11 @@ services:
         sync: false
       - key: R2_BUCKET_NAME
         sync: false
+      - key: LLM_PROVIDER
+        value: claude
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.0-flash
       - key: PYTHON_VERSION
         value: "3.11.10"

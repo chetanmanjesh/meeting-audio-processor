@@ -463,6 +463,7 @@ def _process_job(job_id: str, r2_keys: list[str], filenames: list[str], provider
             concise_markdown=concise_md,
             detailed_docx=detailed_docx,
             concise_docx=concise_docx,
+            llm_provider=base.LLM_PROVIDER,
             finished_at=time.time(),
         )
     except Exception as e:
