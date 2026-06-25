@@ -1555,7 +1555,7 @@ function showErrorWithRetry(jobId, msg) {
   e.appendChild(text);
   const note = document.createElement("div");
   note.style.cssText = "font-size:13px; color:var(--muted); margin-top:6px;";
-  note.textContent = "Cached intermediates will be reused — retrying won't re-pay for transcription or Claude steps already completed.";
+  note.textContent = "Cached intermediates will be reused — retrying won't re-pay for transcription or any extraction steps already completed.";
   e.appendChild(note);
   const btn = document.createElement("button");
   btn.textContent = "↻ Retry";

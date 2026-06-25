@@ -246,10 +246,13 @@ def _gemini_stream_json(system_prompt: str, user_content: str, max_tokens: int, 
 
     Uses response_mime_type='application/json' so Gemini constrains the output
     to a JSON value (no markdown fences). System instruction holds the schema.
+    Retries on 503 / overload errors with exponential backoff — Google's free-tier
+    capacity is bursty and transient 503s are common.
     """
     try:
         from google import genai
         from google.genai import types as gtypes
+        from google.genai import errors as gerrors
     except ImportError as e:
         raise RuntimeError(
             "google-genai not installed. `pip install google-genai` first."
@@ -264,26 +267,51 @@ def _gemini_stream_json(system_prompt: str, user_content: str, max_tokens: int, 
         max_output_tokens=max_tokens,
         temperature=0.2,
     )
-    pieces = []
-    stream = client.models.generate_content_stream(
-        model=GEMINI_MODEL,
-        contents=user_content,
-        config=cfg,
-    )
-    for chunk in stream:
+
+    # Retry transient errors. 503 (overload) and 429 (rate limit) get a few
+    # tries with backoff; everything else fails fast.
+    import time as _time
+    delays = [3, 8, 20, 45]  # ~75 seconds of total backoff budget
+    last_err = None
+    for attempt, sleep_s in enumerate([0] + delays):
+        if sleep_s:
+            print(f"  Gemini retry in {sleep_s}s (attempt {attempt+1})...", file=sys.stderr)
+            _time.sleep(sleep_s)
         try:
-            t = chunk.text
-        except Exception:
-            t = None
-        if not t:
-            continue
-        pieces.append(t)
-        if on_progress:
-            try:
-                on_progress(sum(len(p) for p in pieces))
-            except Exception:
-                pass
-    return json.loads(_strip_json_fences("".join(pieces)))
+            pieces = []
+            stream = client.models.generate_content_stream(
+                model=GEMINI_MODEL,
+                contents=user_content,
+                config=cfg,
+            )
+            for chunk in stream:
+                try:
+                    t = chunk.text
+                except Exception:
+                    t = None
+                if not t:
+                    continue
+                pieces.append(t)
+                if on_progress:
+                    try:
+                        on_progress(sum(len(p) for p in pieces))
+                    except Exception:
+                        pass
+            return json.loads(_strip_json_fences("".join(pieces)))
+        except gerrors.ClientError as e:
+            # 429 RESOURCE_EXHAUSTED is retryable; everything else (e.g. 400 bad request) is not.
+            code = getattr(e, "code", None) or getattr(e, "status_code", None)
+            if str(code) != "429":
+                raise
+            last_err = e
+        except gerrors.ServerError as e:
+            # 5xx including 503 UNAVAILABLE
+            last_err = e
+        except Exception as e:
+            # Network blips / connection resets — also retry
+            last_err = e
+    # Out of retries
+    raise last_err
 
 
 def _llm_stream_json(system_prompt: str, user_content: str, max_tokens: int, on_progress=None) -> dict:
