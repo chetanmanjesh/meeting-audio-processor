@@ -31,10 +31,12 @@ load_dotenv()
 CLAUDE_MODEL = "claude-sonnet-4-6"
 
 # LLM provider switch — controls extract_mom() and condense_to_concise().
-# "claude" (default): uses Anthropic Sonnet. ~₹25 per meeting.
-# "gemini":          uses Google Gemini Flash 2.0. Free at 1,500 req/day.
+#   "claude":   Anthropic Sonnet. ~₹25/meeting. Most reliable + polished.
+#   "gemini":   Google Gemini Flash. Free up to daily cap but capacity-bursty.
+#   "deepseek": DeepSeek V3. ~₹2/meeting (paid but cheap). Quality close to Sonnet.
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "claude").strip().lower()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")  # 'deepseek-chat' = V3; 'deepseek-reasoner' = R1
 
 MOM_SYSTEM_PROMPT = """You extract DETAILED, GRANULAR, and WELL-STRUCTURED minutes of meetings (MoM) from diarized transcripts of design / construction / project meetings.
 
@@ -314,10 +316,59 @@ def _gemini_stream_json(system_prompt: str, user_content: str, max_tokens: int, 
     raise last_err
 
 
+def _deepseek_stream_json(system_prompt: str, user_content: str, max_tokens: int, on_progress=None) -> dict:
+    """Stream a JSON response from DeepSeek (V3 by default) and parse it.
+
+    DeepSeek's API is OpenAI-compatible — we use the `openai` SDK pointed at
+    https://api.deepseek.com. The `response_format={'type': 'json_object'}`
+    parameter constrains output to a JSON value (similar to Gemini's
+    response_mime_type). When using JSON mode, the prompt must mention "json"
+    somewhere — our system prompt already does.
+    """
+    try:
+        from openai import OpenAI
+    except ImportError as e:
+        raise RuntimeError(
+            "openai SDK not installed. `pip install openai` first."
+        ) from e
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise RuntimeError("DEEPSEEK_API_KEY not set on server (LLM_PROVIDER=deepseek requires it).")
+    client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+    pieces = []
+    stream = client.chat.completions.create(
+        model=DEEPSEEK_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        max_tokens=max_tokens,
+        temperature=0.2,
+        stream=True,
+        response_format={"type": "json_object"},
+    )
+    for chunk in stream:
+        try:
+            t = chunk.choices[0].delta.content
+        except (AttributeError, IndexError):
+            t = None
+        if not t:
+            continue
+        pieces.append(t)
+        if on_progress:
+            try:
+                on_progress(sum(len(p) for p in pieces))
+            except Exception:
+                pass
+    return json.loads(_strip_json_fences("".join(pieces)))
+
+
 def _llm_stream_json(system_prompt: str, user_content: str, max_tokens: int, on_progress=None) -> dict:
     """Dispatch to the configured LLM provider."""
     if LLM_PROVIDER == "gemini":
         return _gemini_stream_json(system_prompt, user_content, max_tokens, on_progress)
+    if LLM_PROVIDER == "deepseek":
+        return _deepseek_stream_json(system_prompt, user_content, max_tokens, on_progress)
     return _claude_stream_json(system_prompt, user_content, max_tokens, on_progress)
 
 

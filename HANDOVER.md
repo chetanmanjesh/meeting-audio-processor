@@ -78,9 +78,11 @@ meeting-audio-processor/
 | `DEEPGRAM_API_KEY` | yes (if user picks Deepgram) | nova-3 transcription |
 | `SARVAM_API_KEY` | yes (if user picks Sarvam) | Saarika batch ASR |
 | `ANTHROPIC_API_KEY` | yes (if LLM_PROVIDER=claude) | Claude Sonnet for MoM extraction + condense |
-| `LLM_PROVIDER` | optional; default `claude` | `claude` or `gemini` |
+| `LLM_PROVIDER` | optional; default `claude` | `claude`, `gemini`, or `deepseek` |
 | `GEMINI_API_KEY` | if LLM_PROVIDER=gemini | From https://aistudio.google.com/app/apikey |
 | `GEMINI_MODEL` | optional; default `gemini-2.0-flash` | Try `gemini-2.5-flash` if free-tier quota issues |
+| `DEEPSEEK_API_KEY` | if LLM_PROVIDER=deepseek | From https://platform.deepseek.com/api_keys |
+| `DEEPSEEK_MODEL` | optional; default `deepseek-chat` | `deepseek-chat` is V3; `deepseek-reasoner` is R1 |
 | `R2_ACCOUNT_ID` | yes | Cloudflare account ID |
 | `R2_ACCESS_KEY_ID` | yes | R2 API token |
 | `R2_SECRET_ACCESS_KEY` | yes | R2 API token secret |
