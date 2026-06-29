@@ -28,12 +28,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-CLAUDE_MODEL = "claude-sonnet-4-6"
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 
 # LLM provider switch — controls extract_mom() and condense_to_concise().
-#   "claude":   Anthropic Sonnet. ~₹25/meeting. Most reliable + polished.
+#   "claude":   Anthropic. CLAUDE_MODEL picks the model:
+#                 claude-sonnet-4-6 (default, ~₹25/meeting, most reliable + polished)
+#                 claude-haiku-4-5  (~5x cheaper; A/B-test quality before defaulting)
 #   "gemini":   Google Gemini Flash. Free up to daily cap but capacity-bursty.
-#   "deepseek": DeepSeek V3. ~₹2/meeting (paid but cheap). Quality close to Sonnet.
+#   "deepseek": DeepSeek. DEEPSEEK_MODEL picks the model:
+#                 deepseek-chat     (V3, ~₹2/meeting, paid but cheap)
+#                 deepseek-reasoner (R1, reasoning model; pricier, better at complex instructions)
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "claude").strip().lower()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")  # 'deepseek-chat' = V3; 'deepseek-reasoner' = R1
@@ -336,7 +340,7 @@ def _deepseek_stream_json(system_prompt: str, user_content: str, max_tokens: int
         raise RuntimeError("DEEPSEEK_API_KEY not set on server (LLM_PROVIDER=deepseek requires it).")
     client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
     pieces = []
-    stream = client.chat.completions.create(
+    create_kwargs = dict(
         model=DEEPSEEK_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
@@ -345,8 +349,11 @@ def _deepseek_stream_json(system_prompt: str, user_content: str, max_tokens: int
         max_tokens=max_tokens,
         temperature=0.2,
         stream=True,
-        response_format={"type": "json_object"},
     )
+    # deepseek-chat (V3) supports JSON mode; deepseek-reasoner (R1) rejects it.
+    if DEEPSEEK_MODEL.startswith("deepseek-chat"):
+        create_kwargs["response_format"] = {"type": "json_object"}
+    stream = client.chat.completions.create(**create_kwargs)
     for chunk in stream:
         try:
             t = chunk.choices[0].delta.content
