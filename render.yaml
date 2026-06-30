@@ -24,9 +24,9 @@ services:
       - key: R2_BUCKET_NAME
         sync: false
       - key: LLM_PROVIDER
-        value: claude
+        sync: false   # set manually in dashboard; code defaults to "claude"
       - key: CLAUDE_MODEL
-        value: claude-sonnet-4-6
+        sync: false   # set manually in dashboard; code defaults to "claude-sonnet-4-6"
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_MODEL
